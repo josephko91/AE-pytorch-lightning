@@ -1,14 +1,16 @@
 __author__ = "Alexander Koenig, Li Nguyen"
+# modified by Joseph Ko 
 
 from argparse import ArgumentParser
-
-import pytorch_lightning as pl
+# import pytorch_lightning as pl # old import
+import lightning as L # updated import 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
-from pytorch_lightning import Trainer, loggers
+# from pytorch_lightning import Trainer, loggers
+from lightning.pytorch import Trainer, loggers
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Subset
 from torchsummary import summary
@@ -18,13 +20,12 @@ from torchvision.datasets import ImageFolder
 MEAN = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
 STD = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32)
 
-
-class Autoencoder(pl.LightningModule):
+# Following latest Pytorch Lightning style guide
+# see: https://lightning.ai/docs/pytorch/stable/starter/style_guide.html
+class Encoder(nn.Module):
     def __init__(self, hparams):
         super().__init__()
-        self.hparams = hparams
-
-        self.encoder = nn.Sequential(
+        self.f = nn.Sequential(
             # input (nc) x 128 x 128
             nn.Conv2d(hparams.nc, hparams.nfe, 4, 2, 1, bias=False),
             nn.BatchNorm2d(hparams.nfe),
@@ -52,7 +53,13 @@ class Autoencoder(pl.LightningModule):
             # output (nz) x 1 x 1
         )
 
-        self.decoder = nn.Sequential(
+    def forward(self, x):
+        return self.f(x)
+
+class Decoder(nn.Module):
+    def __init__(self, hparams):
+        super().__init__()
+        self.f = nn.Sequential(
             # input (nz) x 1 x 1
             nn.ConvTranspose2d(hparams.nz, hparams.nfd * 16, 4, 1, 0, bias=False),
             nn.BatchNorm2d(hparams.nfd * 16),
@@ -80,26 +87,36 @@ class Autoencoder(pl.LightningModule):
         )
 
     def forward(self, x):
+        return self.f(x)
+
+class Autoencoder(L.LightningModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.params = hparams
+        self.validation_step_outputs = [] # lightning>=2.0.0
+        self.test_step_outputs = []
+        self.encoder = Encoder(hparams)
+        self.decoder = Decoder(hparams)
+
+    def forward(self, x):
         x = self.encoder(x)
         x = self.decoder(x)
         return x
 
     def prepare_data(self):
-
         transform = transforms.Compose(
             [
-                transforms.Resize(self.hparams.image_size),
-                transforms.CenterCrop(self.hparams.image_size),
+                transforms.Resize(self.params.image_size),
+                transforms.CenterCrop(self.params.image_size),
                 transforms.ToTensor(),
                 transforms.Normalize(MEAN.tolist(), STD.tolist()),
             ]
         )
-
-        dataset = ImageFolder(root=self.hparams.data_root, transform=transform)
+        dataset = ImageFolder(root=self.params.data_root, transform=transform)
 
         # train, val and test split taken from "list_eval_partition.txt" of original celebA paper
-        end_train_idx = 162770
-        end_val_idx = 182637
+        end_train_idx = 100
+        end_val_idx = 150
         end_test_idx = len(dataset)
 
         self.train_dataset = Subset(dataset, range(0, end_train_idx))
@@ -108,28 +125,27 @@ class Autoencoder(pl.LightningModule):
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset, batch_size=self.hparams.batch_size, shuffle=True, num_workers=self.hparams.num_workers
+            self.train_dataset, batch_size=self.params.batch_size, shuffle=True, num_workers=self.params.num_workers
         )
 
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers
+            self.val_dataset, batch_size=self.params.batch_size, num_workers=self.params.num_workers
         )
 
     def test_dataloader(self):
         return DataLoader(
-            self.test_dataset, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers
+            self.test_dataset, batch_size=self.params.batch_size, num_workers=self.params.num_workers
         )
 
     def configure_optimizers(self):
-        return Adam(self.parameters(), lr=self.hparams.lr, betas=(self.hparams.beta1, self.hparams.beta2))
+        return Adam(self.parameters(), lr=self.params.lr, betas=(self.params.beta1, self.params.beta2))
 
     def save_images(self, x, output, name, n=16):
         """
         Saves a plot of n images from input and output batch
         """
-
-        if self.hparams.batch_size < n:
+        if self.params.batch_size < n:
             raise IndexError("You are trying to plot more images than your batch contains!")
 
         # denormalize images
@@ -160,11 +176,15 @@ class Autoencoder(pl.LightningModule):
         output = self(x)
         loss = F.mse_loss(output, x)
         logs = {"val_loss": loss}
+        self.validation_step_outputs.append(loss) # lightning>=2.0.0
         return {"val_loss": loss, "log": logs}
 
-    def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+    # def validation_epoch_end(self, outputs): # deprecated
+    def on_validation_epoch_end(self): # lightning>=2.0.0
+        # avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        avg_loss = torch.stack(self.validation_step_outputs).mean() # lightning>=2.0.0
         logs = {"avg_val_loss": avg_loss}
+        self.validation_step_outputs.clear() # free memory 
         return {"avg_val_loss": avg_loss, "log": logs}
 
     def test_step(self, batch, batch_idx):
@@ -175,32 +195,35 @@ class Autoencoder(pl.LightningModule):
         # save input and output images at beginning of epoch
         if batch_idx == 0:
             self.save_images(x, output, "test_input_output")
-
+        self.test_step_outputs.append(loss) # lightning>=2.0.0
         logs = {"test_loss": loss}
         return {"test_loss": loss, "log": logs}
 
-    def test_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["test_loss"] for x in outputs]).mean()
+    # def test_epoch_end(self, outputs): # deprecated
+    def on_test_epoch_end(self): # lightning>=2.0.0
+        # avg_loss = torch.stack([x["test_loss"] for x in outputs]).mean()
+        avg_loss = torch.stack(self.test_step_outputs).mean() # lightning>=2.0.0
         logs = {"avg_test_loss": avg_loss}
+        self.test_step_outputs.clear() # free memory 
         return {"avg_test_loss": avg_loss, "log": logs}
 
+### ======================== MAIN ======================== ###
 
 def main(hparams):
     logger = loggers.TensorBoardLogger(hparams.log_dir, name=f"bs{hparams.batch_size}_nf{hparams.nfe}")
-
     model = Autoencoder(hparams)
 
     # print detailed summary with estimated network size
     summary(model, (hparams.nc, hparams.image_size, hparams.image_size), device="cpu")
 
-    trainer = Trainer(logger=logger, gpus=hparams.gpus, max_epochs=hparams.max_epochs)
+    # trainer = Trainer(logger=logger, gpus=hparams.gpus, max_epochs=hparams.max_epochs)
+    trainer = Trainer(logger=logger, devices=hparams.gpus, accelerator='gpu', max_epochs=hparams.max_epochs)
     trainer.fit(model)
     trainer.test(model)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-
     parser.add_argument("--data_root", type=str, default="data", help="Data root directory")
     parser.add_argument("--log_dir", type=str, default="logs", help="Logging directory")
     parser.add_argument("--num_workers", type=int, default=4, help="num_workers > 0 turns on multi-process data loading")
@@ -217,4 +240,5 @@ if __name__ == "__main__":
     parser.add_argument("--gpus", type=int, default=2, help="Number of GPUs. Use 0 for CPU mode")
 
     args = parser.parse_args()
+    # print(args)
     main(args)
